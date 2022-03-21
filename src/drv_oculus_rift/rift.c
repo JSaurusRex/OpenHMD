@@ -676,7 +676,7 @@ vec3f vAverage(vec3f *hist, vec3f new, float distFactor, int tick)
 	printVec3(avg);
 	printf("\n");
 
-	vec3f diff = (vec3f){.x=abs(avg.x - new.x), .y=abs(avg.y - new.y), .z=abs(avg.z - new.z)};
+	vec3f diff = (vec3f){.x=absf(avg.x - new.x), .y=absf(avg.y - new.y), .z=absf(avg.z - new.z)};
 	float distance = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
 	int distHist = distFactor / distance;
 
