@@ -655,7 +655,7 @@ vec3f vAverage(vec3f *hist, vec3f new, float distFactor, int tick)
 	vec3f total = {0,0,0};
 	for(int i = 0; i < HISTLENGTH; i++)
 	{
-		printf("hist %i", i);
+		printf("hist %i ", i);
 		printVec3(hist[i]);
 		printf("\n");
 		total.x += hist[i].x;
@@ -697,7 +697,7 @@ vec3f vAverage(vec3f *hist, vec3f new, float distFactor, int tick)
 	avg.y = total.y / (distHist +1);
 	avg.z = total.z / (distHist +1);
 
-	// hist[tick%HISTLENGTH] = new;
+	hist[1] = new;
 	return avg;
 }
 
