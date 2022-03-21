@@ -732,7 +732,8 @@ static int getf_hmd(rift_hmd_t *hmd, ohmd_float_value type, float* out)
 		if (hmd->tracked_dev) {
 			rift_tracked_device_get_view_pose(hmd->tracked_dev, &pose, NULL, NULL, NULL);
 		}
-		*(vec3f*)out = vAverage(hmdPos, pose.pos, 0.05f, tick);
+		// *(vec3f*)out = vAverage(hmdPos, pose.pos, 0.05f, tick);
+		*(vec3f*)out = pose.pos;
 		tick++;
 		break;
 
