@@ -655,9 +655,9 @@ vec3f vAverage(vec3f *hist, vec3f new, float distFactor, int tick)
 	vec3f total = {0,0,0};
 	for(int i = 0; i < HISTLENGTH; i++)
 	{
-		printf("hist %i ", i);
-		printVec3(hist[i]);
-		printf("\n");
+		// printf("hist %i ", i);
+		// printVec3(hist[i]);
+		// printf("\n");
 		total.x += hist[i].x;
 		total.y += hist[i].y;
 		total.z += hist[i].z;
@@ -668,9 +668,9 @@ vec3f vAverage(vec3f *hist, vec3f new, float distFactor, int tick)
 	avg.z = total.z / HISTLENGTH;
 
 
-	printf("avg ");
-	printVec3(total);
-	printf("\n");
+	//printf("avg ");
+	//printVec3(total);
+	//printf("\n");
 
 	printf("avg ");
 	printVec3(avg);
@@ -680,8 +680,8 @@ vec3f vAverage(vec3f *hist, vec3f new, float distFactor, int tick)
 	float distance = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
 	int distHist = distFactor / distance;
 
-	printf("distHist: %i   distance: %f\n", distHist, distance);
-	printf("tick: %i   %i\n", tick, tick%HISTLENGTH);
+	//printf("distHist: %i   distance: %f\n", distHist, distance);
+	//printf("tick: %i   %i\n", tick, tick%HISTLENGTH);
 
 	if(distHist >= HISTLENGTH)
 		distHist = HISTLENGTH-1;
@@ -732,7 +732,7 @@ static int getf_hmd(rift_hmd_t *hmd, ohmd_float_value type, float* out)
 		if (hmd->tracked_dev) {
 			rift_tracked_device_get_view_pose(hmd->tracked_dev, &pose, NULL, NULL, NULL);
 		}
-		*(vec3f*)out = vAverage(hmdPos, pose.pos, 0.01f, tick);
+		*(vec3f*)out = vAverage(hmdPos, pose.pos, 0.05f, tick);
 		tick++;
 		break;
 
@@ -819,7 +819,7 @@ static int getf_touch_controller(rift_device_priv* dev_priv, ohmd_float_value ty
 		if (touch->tracked_dev) {
 			rift_tracked_device_get_view_pose(touch->tracked_dev, &pose, NULL, NULL, NULL);
 		}
-		*(vec3f*)out = vAverage(controllerPos[controllerIndex], pose.pos, 0.01f, tick);
+		*(vec3f*)out = vAverage(controllerPos[controllerIndex], pose.pos, 0.05f, tick);
 		break;
 	case OHMD_VELOCITY_VECTOR: {
 		vec3f vel = { 0, };
