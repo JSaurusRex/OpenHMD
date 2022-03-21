@@ -94,6 +94,17 @@ typedef enum {
 	OHMD_ANALOG = 1
 } ohmd_control_type;
 
+
+/**
+ * Define that says VELOCITY and ACCELERATION properties are available in this API
+ */
+#define OHMD_HAVE_VEL_ACCEL_API_v0
+
+/**
+ * Define that says ANGULAR VELOCITY and ANGULAR ACCELERATION properties are available in this API
+ */
+#define OHMD_HAVE_VEL_ACCEL_API_v1
+
 /** A collection of float value information types, used for getting and setting information with
     ohmd_device_getf() and ohmd_device_setf(). */
 typedef enum {
@@ -163,6 +174,17 @@ typedef enum {
 	/** float[OHMD_CONTROL_COUNT] (get): Get the state of the device's controls. */
 	OHMD_CONTROLS_STATE                = 22,
 
+	/** float[3] (get): A 3-D vector representing the velocity of the device (m/s). */
+	OHMD_VELOCITY_VECTOR                  =  23,
+
+	/** float[3] (get): A 3-D vector representing the acceleration of the device (m/s^2). */
+	OHMD_ACCELERATION_VECTOR              =  24,
+
+	/** float[3] (get): A 3-D vector representing the angular velocity of the device (rad/s). */
+	OHMD_ANGULAR_VELOCITY_VECTOR          =  25,
+
+	/** float[3] (get): A 3-D vector representing the angular acceleration of the device (rad/s^2). */
+	OHMD_ANGULAR_ACCELERATION_VECTOR      =  26,
 } ohmd_float_value;
 
 /** A collection of int value information types used for getting information with ohmd_device_geti(). */
@@ -226,6 +248,7 @@ typedef enum
 	OHMD_DEVICE_FLAGS_ROTATIONAL_TRACKING = 4,
 	OHMD_DEVICE_FLAGS_LEFT_CONTROLLER     = 8,
 	OHMD_DEVICE_FLAGS_RIGHT_CONTROLLER    = 16,
+	OHMD_DEVICE_FLAGS_HAPTIC_FEEDBACK     = 32,
 } ohmd_device_flags;
 
 /** An opaque pointer to a context structure. */
@@ -451,6 +474,26 @@ OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_device_seti(ohmd_device* device, ohmd_in
  * @return 0 on success, <0 on failure.
  **/
 OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_device_set_data(ohmd_device* device, ohmd_data_value type, const void* in);
+
+/**
+ * Define that indicates haptics API is available in this OpenHMD
+ */
+#define OHMD_HAVE_HAPTICS_API_v0
+
+/**
+ * Turn on haptics for a device with OHMD_DEVICE_FLAGS_HAPTIC_FEEDBACK flag
+ *
+ * @param device An open device to control haptics on
+ * @param duration The duration of the haptic pulse in seconds
+ * @param frequency The frequency of the vibration in Hz
+ * @param amplitude Haptic amplitude between 0 and 1.0
+ */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_device_set_haptics_on(ohmd_device* device, float duration, float frequency, float amplitude);
+
+/**
+ * Immediately cancel and turn off any haptics for a device with OHMD_DEVICE_FLAGS_HAPTIC_FEEDBACK flag
+ */
+OHMD_APIENTRYDLL int OHMD_APIENTRY ohmd_device_set_haptics_off(ohmd_device* device);
 
 /**
  * Get the library version.

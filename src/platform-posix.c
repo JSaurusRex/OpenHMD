@@ -18,9 +18,13 @@
 
 #include <time.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <pthread.h>
 #include <string.h>
+#include <errno.h>
+#include <assert.h>
 
 #include "platform.h"
 #include "openhmdi.h"
@@ -173,6 +177,47 @@ void ohmd_unlock_mutex(ohmd_mutex* mutex)
 		pthread_mutex_unlock((pthread_mutex_t*)mutex);
 }
 
+ohmd_cond* ohmd_create_cond(ohmd_context* ctx)
+{
+	pthread_cond_t* cond = ohmd_alloc(ctx, sizeof(pthread_cond_t));
+	if(cond == NULL)
+		return NULL;
+
+	int ret = pthread_cond_init(cond, NULL);
+
+	if(ret != 0){
+		free(cond);
+		cond = NULL;
+	}
+
+	return (ohmd_cond*)cond;
+}
+
+void ohmd_destroy_cond(ohmd_cond* cond)
+{
+	pthread_cond_destroy((pthread_cond_t*)cond);
+	free(cond);
+}
+
+void ohmd_cond_wait(ohmd_cond* cond, ohmd_mutex* mutex)
+{
+	if (cond && mutex)
+		pthread_cond_wait((pthread_cond_t*)cond, (pthread_mutex_t*)mutex);
+}
+
+void ohmd_cond_signal(ohmd_cond* cond)
+{
+	if (cond)
+		pthread_cond_signal((pthread_cond_t*)cond);
+}
+
+void ohmd_cond_broadcast(ohmd_cond* cond)
+{
+	if (cond)
+		pthread_cond_broadcast((pthread_cond_t*)cond);
+}
+
+
 /// Handling ovr service
 void ohmd_toggle_ovr_service(int state) //State is 0 for Disable, 1 for Enable
 {
@@ -188,4 +233,135 @@ int findEndPoint(char* path, int endpoint)
 	}
 	return 0;
 }
+
+int ohmd_read_file(const char* filename, char **out_buf, unsigned long *out_len)
+{
+	FILE* f = fopen(filename, "rb");
+  long file_len, total_read = 0;
+  char *buffer;
+  int ret;
+
+  if (f == NULL)
+    return errno;
+
+	ret = fseek(f, 0, SEEK_END);
+  if (ret != 0)
+    goto fail;
+
+	file_len = ftell(f);
+  if (file_len < 0) {
+    ret = errno;
+    goto fail;
+  }
+
+	ret = fseek(f, 0, SEEK_SET);
+
+	buffer = malloc(file_len + 1);
+  buffer[file_len] = 0;
+
+  while (total_read < file_len) {
+	  size_t n_read = fread(buffer, file_len, 1, f);
+    if (n_read > 0) {
+      total_read += file_len;
+    } else {
+      if (feof(f))
+        break;
+      ret = errno;
+      if (ret != EINTR)
+        goto fail;
+    }
+  }
+
+  *out_buf = buffer;
+  *out_len = (unsigned long) file_len;
+fail:
+	fclose(f);
+	return ret;
+}
+
+int ohmd_ensure_path(const char* pathname)
+{
+	int ret;
+	struct stat sb;
+	char pathbuf[OHMD_STR_SIZE+1];
+	char *separator, *cur;
+
+	/* Path must be at least 2 chars */
+	assert (strlen(pathname) > 1);
+
+	/* Check if the path exists */
+	ret = stat(pathname, &sb);
+	if (ret < 0 && errno != ENOENT)
+		return errno;
+	if (ret == 0) {
+		if (!S_ISDIR(sb.st_mode)) {
+			return errno;
+		}
+		return 0; /* Success. It already exists and is a dir */
+	}
+
+	/* Recursively create all components of a path name */
+	strncpy(pathbuf, pathname, OHMD_STR_SIZE);
+	cur = pathbuf + 1;
+	while ((separator = strstr(cur, "/")) != NULL) {
+		*separator = '\0'; /* Shorten the string to just the path so far */
+
+		/* Check if the path exists */
+		ret = stat(pathbuf, &sb);
+		if (ret != 0) {
+			if (errno != ENOENT)
+				return errno;
+			/* This path doesn't exist, create it */
+			if ((ret = mkdir(pathbuf, 0777)) != 0)
+				return ret;
+		} else if (!S_ISDIR(sb.st_mode)) {
+			return ENOTDIR;
+		}
+
+		/* Replace the separator and advance to the next */
+		*separator = '/';
+		cur = separator + 1;
+	}
+
+	/* Create the final path component */
+	return mkdir(pathname, 0777);
+}
+
+int ohmd_write_file(const char* filename, char *buf, unsigned long buf_len)
+{
+	FILE* f = fopen(filename, "w");
+
+	if (f == NULL)
+		return errno;
+
+	if (fwrite(buf, 1, buf_len, f) != 1) {
+		if (ferror(f))
+			return errno;
+	}
+
+	return fclose(f);
+}
+
+const char *ohmd_get_config_dir(ohmd_context *ctx)
+{
+  char *env;
+
+  if (ctx->config_dir[0] != 0)
+    return ctx->config_dir;
+
+  env = getenv("XDG_CONFIG_HOME");
+  if (env) {
+    snprintf (ctx->config_dir, OHMD_STR_SIZE, "%s/openhmd", env);
+    return ctx->config_dir;
+  }
+  env = getenv("HOME");
+  if (env) {
+    snprintf (ctx->config_dir, OHMD_STR_SIZE, "%s/.config/openhmd", env);
+    return ctx->config_dir;
+  }
+
+  snprintf (ctx->config_dir, OHMD_STR_SIZE, "/tmp/openhmd");
+  return ctx->config_dir;
+}
+
 #endif

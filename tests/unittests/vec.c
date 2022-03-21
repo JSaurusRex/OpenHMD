@@ -76,6 +76,7 @@ void test_ovec3f_get_angle()
 		{ {{1, 0, 0}}, {{0, 0, 0}}, 0},
 		{ {{2, 4, 3}}, {{1, 2, 3}}, 0.33940126397005316},
 		{ {{2, 4, 3}}, {{-1, 2, 3}}, 0.7311043352203973},
+		{ {{ -0.138361,0.000000,0.969686 }}, {{ -0.140853,0.000000,0.987947 }}, 0.0},
 	};
 
 	int sz = sizeof(vec2_float);
@@ -104,4 +105,15 @@ void test_ovec3f_get_dot()
 	}
 }
 
+void test_ovec3f_inverse()
+{
+	const float t = 0.001;
+	vec3f v1 = {{ 5.0, 10.0, -23.0}};
+	vec3f v2;
+
+	v2 = v1;
+	ovec3f_inverse (&v2);
+	ovec3f_inverse (&v2);
+	TAssert(vec3f_eq(v1, v2, t));
+}
 

@@ -25,6 +25,7 @@
 
 #define OHMD_MAX(_a, _b) ((_a) > (_b) ? (_a) : (_b))
 #define OHMD_MIN(_a, _b) ((_a) < (_b) ? (_a) : (_b))
+#define OHMD_CLAMP(_a, minval, maxval) (OHMD_MAX (OHMD_MIN((_a), (maxval)), (minval)))
 
 #define OHMD_STRINGIFY(_what) #_what
 
@@ -101,6 +102,7 @@ struct ohmd_device {
 	int (*setf)(ohmd_device* device, ohmd_float_value type, const float* in);
 	int (*seti)(ohmd_device* device, ohmd_int_value type, const int* in);
 	int (*set_data)(ohmd_device* device, ohmd_data_value type, const void* in);
+	int (*set_haptics)(ohmd_device* device, bool enable, float duration, float frequency, float amplitude);
 
 	void (*update)(ohmd_device* device);
 	void (*close)(ohmd_device* device);
@@ -133,6 +135,7 @@ struct ohmd_context {
 	uint64_t monotonic_ticks_per_sec;
 
 	char error_msg[OHMD_STR_SIZE];
+	char config_dir[OHMD_STR_SIZE];
 };
 
 // helper functions
@@ -144,6 +147,10 @@ void ohmd_set_default_device_properties(ohmd_device_properties* props);
 void ohmd_calc_default_proj_matrices(ohmd_device_properties* props);
 void ohmd_set_universal_distortion_k(ohmd_device_properties* props, float a, float b, float c, float d);
 void ohmd_set_universal_aberration_k(ohmd_device_properties* props, float r, float g, float b);
+
+const char *ohmd_get_config_dir(ohmd_context *ctx);
+int ohmd_set_config(ohmd_context *ctx, const char *key, char *buf, unsigned long buf_len);
+int ohmd_get_config(ohmd_context *ctx, const char *key, char **out_buf, unsigned long *out_len);
 
 // drivers
 ohmd_driver* ohmd_create_dummy_drv(ohmd_context* ctx);

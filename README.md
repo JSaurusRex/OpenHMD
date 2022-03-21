@@ -1,6 +1,26 @@
 # OpenHMD
 This project aims to provide a Free and Open Source API and drivers for immersive technology, such as head mounted displays with built in head tracking.
 
+## Oculus Rift Development
+
+This repository is primarily for development of support for Oculus Rift CV1 and Rift S headsets.
+
+### Oculus Rift CV1
+
+2020-09-11 - Upstream OpenHMD has support for 3DOF tracking of the headset and hand controllers.
+
+Development toward full positional tracking is happening here in the https://github.com/thaytan/OpenHMD/tree/rift-correspondence-search branch. This branch has the latest code for ab-initio matching of observed LEDs to tracked devices.
+
+My current focus is on rearragnging the computer vision to:
+ * Capture and do initial analysis in a thread per oculus sensor to check for good tracking.
+ * Offload frames to a dedicated computer vision thread if tracking is lost.
+ * Initialisation of the relative poses of each sensor on startup, and detection of cameras being moved.
+ * Full Kalman filtering of the position and orientation, extracting biases.
+
+### Oculus Rift S
+
+2020-06-01 - For Rift S, current development is focussed on reverse engineering the headset USB protocol and firmware details. There is a preliminary driver that supports 3DOF for the headset only, with no distortion in https://github.com/thaytan/OpenHMD/tree/dev-rift-s
+
 ## License
 OpenHMD is released under the permissive Boost Software License (see LICENSE for more information), to make sure it can be linked and distributed with both free and non-free software. While it doesn't require contribution from the users, it is still very appreciated.
 

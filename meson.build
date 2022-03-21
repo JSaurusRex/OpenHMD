@@ -1,5 +1,5 @@
 project(
-	'openhmd', 'c',
+	'openhmd', 'c', 'cpp',
 	default_options: 'c_std=c99',
 	version: '0.3.0',
 	meson_version: '>= 0.44',
@@ -32,6 +32,22 @@ if not dep_hidapi.found()
 	dep_hidapi = proj_hidapi.get_variable('hidapi_dep')
 endif
 dep_threads = dependency('threads')
+dep_libusb = dependency('libusb-1.0', required: false)
+if not dep_libusb.found()
+	proj_hidapi = subproject('hidapi')
+	dep_libusb = proj_hidapi.get_variable('libusb_dep')
+endif
+dep_threads = dependency('threads')
+dep_opencv = dependency('opencv4', required: false)
+if not dep_opencv.found()
+	# On Windows, search via cmake
+        dep_opencv = dependency('opencv', method: 'cmake', modules: ['opencv_core'])
+endif
+if not dep_opencv.found()
+	dep_opencv = dependency('opencv')
+endif
+
+dep_jpeg = dependency('libjpeg', required: false)
 
 deps = [
 	dep_libm,
@@ -47,15 +63,39 @@ sources = [
 	'src/openhmd.c',
 	'src/drv_dummy/dummy.c',
 	'src/omath.c',
+	'src/exponential-filter.c',
 	'src/fusion.c',
+	'src/matrices.c',
 	'src/shaders.c',
+	'src/unscented.c',
+	'src/ukf.c',
 ]
 if host_machine.system() == 'windows'
 	sources += 'src/platform-win32.c'
 else
 	sources += 'src/platform-posix.c'
 endif
+
 c_args = []
+debugging_mode = get_option('debugging_mode')
+have_pipewire = false
+if debugging_mode
+	c_args += '-DOHMD_DEBUGGING_MODE'
+
+	pw_dep = dependency('libpipewire-0.3', version : '>= 0.3.0', required : false)
+	spa_dep = dependency('libspa-0.2', version : '>= 0.2', required: false)
+	have_pipewire = debugging_mode and pw_dep.found() and spa_dep.found()
+endif
+
+if have_pipewire
+	c_args += '-DHAVE_PIPEWIRE=1'
+	c_args += '-DHAVE_DEBUG_STREAM=1'
+	deps += [ pw_dep, spa_dep ]
+	sources += [ 'src/drv_oculus_rift/ohmd-pipewire.c' ]
+endif
+
+publish_c_args = []
+
 if get_option('default_library') == 'shared'
 	if host_machine.system() == 'windows'
 		c_args += '-DDLL_EXPORT'
@@ -65,7 +105,13 @@ if get_option('default_library') == 'shared'
 else
 	if host_machine.system() == 'windows'
 		c_args += '-DOHMD_STATIC'
+		publish_c_args += '-DOHMD_STATIC'
 	endif
+endif
+
+if dep_jpeg.found()
+	c_args += '-DHAVE_LIBJPEG'
+	sources += [ 'src/drv_oculus_rift/ohmd-jpeg.c' ]
 endif
 
 _drivers = get_option('drivers')
@@ -74,9 +120,37 @@ if _drivers.contains('rift')
 		'src/drv_oculus_rift/rift.c',
 		'src/drv_oculus_rift/rift-hmd-radio.c',
 		'src/drv_oculus_rift/packet.c',
+		'src/drv_oculus_rift/rift-sensor.c',
+		'src/drv_oculus_rift/rift-sensor-usb.c',
+		'src/drv_oculus_rift/rift-sensor-opencv.cpp',
+		'src/drv_oculus_rift/rift-sensor-maths.c',
+		'src/drv_oculus_rift/rift-sensor-blobwatch.c',
+		'src/drv_oculus_rift/rift-sensor-flicker.c',
+		'src/drv_oculus_rift/rift-sensor-pose-helper.c',
+		'src/drv_oculus_rift/rift-sensor-pose-search.c',
+		'src/drv_oculus_rift/sensor/ar0134.c',
+		'src/drv_oculus_rift/sensor/mt9v034.c',
+		'src/drv_oculus_rift/sensor/esp570.c',
+		'src/drv_oculus_rift/sensor/esp770u.c',
+		'src/drv_oculus_rift/sensor/uvc.c',
+		'src/drv_oculus_rift/rift-tracker.c',
+		'src/drv_oculus_rift/rift-kalman-6dof.c',
+    'src/drv_oculus_rift/correspondence_search.c',
+    'src/drv_oculus_rift/led_search.c',
+		'src/drv_oculus_rift/ohmd-video.c',
+		'src/ext_deps/nxjson.c'
 	]
 	c_args += '-DDRIVER_OCULUS_RIFT'
+	c_args += '-DHAVE_OPENCV=1'
 	deps += dep_hidapi
+	deps += dep_libusb
+	deps += dep_opencv
+	if dep_jpeg.found()
+		deps += dep_jpeg
+	endif
+  if have_pipewire
+		sources += ['src/drv_oculus_rift/rift-debug-draw.c']
+  endif
 endif
 
 _drivers = get_option('drivers')
@@ -176,6 +250,7 @@ openhmd_lib = library(
 	sources,
 	include_directories: include_directories('./include'),
 	c_args: c_args,
+	cpp_args: c_args,
 	dependencies: deps,
 	install: true,
 	version: library_version,
@@ -199,6 +274,7 @@ if _examples.contains('simple')
 	executable(
 		'openhmd_simple_example',
 		simple_sources,
+		c_args: publish_c_args,
 		include_directories: include_directories('./include'),
 		link_with: [openhmd_lib],
 		dependencies: deps,
@@ -222,6 +298,7 @@ if _examples.contains('opengl')
 	executable(
 		'openhmd_opengl_example',
 		opengl_sources,
+		c_args: publish_c_args,
 		include_directories: include_directories([
 			'./include',
 			'examples/opengl'
@@ -247,6 +324,7 @@ pkg.generate(
 	subdirs: 'openhmd',
 	requires: hidapi,
 	libraries: openhmd_lib,
+	extra_cflags: publish_c_args,
 	url: 'http://www.openhmd.net/',
 )
 install_headers('include/openhmd.h', subdir: 'openhmd')
@@ -254,6 +332,7 @@ install_headers('include/openhmd.h', subdir: 'openhmd')
 # Declare openhmd as a dependency so it can be used
 # as a meson subproject
 openhmd_dep = declare_dependency(
+  compile_args: publish_c_args,
   include_directories: include_directories('./include'),
   link_with : openhmd_lib)
 
@@ -266,14 +345,17 @@ if get_option('tests')
 		'src/omath.c',
 		'tests/unittests/highlevel.c',
 		'tests/unittests/main.c',
+		'tests/unittests/mat4x4.c',
 		'tests/unittests/quat.c',
 		'tests/unittests/tests.h',
-		'tests/unittests/vec.c'
+		'tests/unittests/vec.c',
+		'tests/unittests/pose.c'
 	]
 
 	unittests = executable(
 		'openhmd_unittests',
 		unittests_sources,
+		c_args: publish_c_args,
 		include_directories: include_directories('./include', './src'),
 		link_with: [openhmd_lib],
 		dependencies: [dep_libm, dep_threads]

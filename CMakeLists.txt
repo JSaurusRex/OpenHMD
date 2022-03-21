@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.1)
 
-project(openhmd C)
+project(openhmd C CXX)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -15,12 +15,14 @@ if (POLICY CMP0063)
 	cmake_policy(SET CMP0063 NEW)
 endif(POLICY CMP0063)
 
+find_package(PkgConfig)
+
 set(LIB_VERSION_MAJOR 0)
 set(LIB_VERSION_MINOR 1)
 set(LIB_VERSION_PATCH 0)
 set(LIB_VERSION_STRING ${LIB_VERSION_MAJOR}.${LIB_VERSION_MINOR}.${LIB_VERSION_PATCH})
 
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${PROJECT_SOURCE_DIR}/cmake/")
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/")
 
 option(BUILD_BOTH_STATIC_SHARED_LIBS OFF)
 
@@ -30,9 +32,13 @@ set(openhmd_source_files
 	${CMAKE_CURRENT_LIST_DIR}/src/platform-win32.c
 	${CMAKE_CURRENT_LIST_DIR}/src/drv_dummy/dummy.c
 	${CMAKE_CURRENT_LIST_DIR}/src/omath.c
+	${CMAKE_CURRENT_LIST_DIR}/src/exponential-filter.c
 	${CMAKE_CURRENT_LIST_DIR}/src/platform-posix.c
 	${CMAKE_CURRENT_LIST_DIR}/src/fusion.c
+	${CMAKE_CURRENT_LIST_DIR}/src/matrices.c
 	${CMAKE_CURRENT_LIST_DIR}/src/shaders.c
+	${CMAKE_CURRENT_LIST_DIR}/src/unscented.c
+	${CMAKE_CURRENT_LIST_DIR}/src/ukf.c
 )
 
 option(OPENHMD_DRIVER_OCULUS_RIFT "Oculus Rift DK1 and DK2" ON)
@@ -51,17 +57,39 @@ option(OPENHMD_EXAMPLE_SIMPLE "Simple test binary" ON)
 option(OPENHMD_EXAMPLE_SDL "SDL OpenGL test (outdated)" OFF)
 
 if(OPENHMD_DRIVER_OCULUS_RIFT)
+  pkg_check_modules(libusb-1.0 REQUIRED libusb-1.0)
+  find_package( OpenCV REQUIRED )
+
 	set(openhmd_source_files ${openhmd_source_files}
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/correspondence_search.c
 	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift.c
 	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-hmd-radio.c
 	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/packet.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor-usb.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor-pose-search.c
 	${CMAKE_CURRENT_LIST_DIR}/src/ext_deps/nxjson.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/led_search.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor-flicker.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor-maths.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor-pose-helper.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor-blobwatch.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-sensor-opencv.cpp
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-tracker.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/rift-kalman-6dof.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/sensor/esp570.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/sensor/esp770u.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/sensor/mt9v034.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/sensor/ar0134.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/sensor/uvc.c
+	${CMAKE_CURRENT_LIST_DIR}/src/drv_oculus_rift/ohmd-video.c
 	)
 	add_definitions(-DDRIVER_OCULUS_RIFT)
+  add_definitions(-DHAVE_OPENCV=1)
 
 	find_package(HIDAPI REQUIRED)
-	include_directories(${HIDAPI_INCLUDE_DIRS})
-	set(LIBS ${LIBS} ${HIDAPI_LIBRARIES})
+  include_directories(${HIDAPI_INCLUDE_DIRS} ${libusb-1.0_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
+	set(LIBS ${LIBS} ${HIDAPI_LIBRARIES} ${libusb-1.0_LIBRARIES} ${OpenCV_LIBS})
 endif(OPENHMD_DRIVER_OCULUS_RIFT)
 
 if(OPENHMD_DRIVER_OCULUS_RIFT_S)

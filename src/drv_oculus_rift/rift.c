@@ -17,9 +17,11 @@
 #include <stdio.h>
 #include <time.h>
 #include <assert.h>
+#include <errno.h>
 
 #include "rift.h"
 #include "rift-hmd-radio.h"
+#include "rift-tracker.h"
 #include "../hid.h"
 
 #define OHMD_GRAVITY_EARTH 9.80665 // m/s²
@@ -29,35 +31,52 @@
 #define SAMSUNG_ELECTRONICS_CO_ID 0x04e8
 #define RIFT_CV1_PID 0x0031
 
-#define TICK_LEN (1.0f / 1000.0f) // 1000 Hz ticks
+#define TICK_LEN (1000000 / 1000) // 1000 Hz ticks, in uS
+#define TICK_US_TO_NS(t) ((t) * 1000)
+#define TICK_US_TO_SEC(t) ((float)(t) / 1000000.0)
+#define TICK_DIFF(a,b) ((int32_t)((a) - (b)))
+
 #define KEEP_ALIVE_VALUE (10 * 1000)
 #define SETFLAG(_s, _flag, _val) (_s) = ((_s) & ~(_flag)) | ((_val) ? (_flag) : 0)
 
+typedef enum {
+	REV_DK1,
+	REV_DK2,
+	REV_CV1,
+
+	REV_GEARVR_GEN1
+} rift_revision;
+
 struct rift_hmd_s {
 	ohmd_context* ctx;
+	rift_revision revision;
 	int use_count;
 
 	hid_device* handle;
 	hid_device* radio_handle;
+	rift_hmd_radio_state radio;
+
 	pkt_sensor_range sensor_range;
+	pkt_imu_calibration imu_calibration;
 	pkt_sensor_display_info display_info;
 	rift_coordinate_frame coordinate_frame, hw_coordinate_frame;
 	pkt_sensor_config sensor_config;
 	pkt_tracker_sensor sensor;
+	bool have_imu_timestamp;
 	uint32_t last_imu_timestamp;
 	double last_keep_alive;
-	fusion sensor_fusion;
-	vec3f raw_mag, raw_accel, raw_gyro;
+	rift_tracked_device *tracked_dev;
 
 	struct {
 		vec3f pos;
 	} imu;
 
 	uint8_t radio_address[5];
-	rift_led *leds;
-	uint8_t num_leds;
+	rift_leds leds;
 
 	uint16_t remote_buttons_state;
+
+	rift_tracker_ctx *tracker_ctx;
 
 	/* OpenHMD output devices */
 	rift_device_priv hmd_dev;
@@ -71,14 +90,6 @@ struct device_list_s {
 
 	device_list_t* next;
 };
-
-typedef enum {
-	REV_DK1,
-	REV_DK2,
-	REV_CV1,
-
-	REV_GEARVR_GEN1
-} rift_revision;
 
 typedef struct {
 	const char* name;
@@ -198,7 +209,7 @@ static void set_coordinate_frame(rift_hmd_t* priv, rift_coordinate_frame coordfr
 	}
 }
 
-static void handle_tracker_sensor_msg(rift_hmd_t* priv, unsigned char* buffer, int size)
+static void handle_tracker_sensor_msg(rift_hmd_t* priv, uint64_t local_ts, unsigned char* buffer, int size)
 {
 	if (buffer[0] == RIFT_IRQ_SENSORS_DK1
 	  && !decode_tracker_sensor_msg_dk1(&priv->sensor, buffer, size)){
@@ -210,32 +221,96 @@ static void handle_tracker_sensor_msg(rift_hmd_t* priv, unsigned char* buffer, i
 	}
 
 	pkt_tracker_sensor* s = &priv->sensor;
+	vec3f raw_mag;
 
 	dump_packet_tracker_sensor(s);
 
 	int32_t mag32[] = { s->mag[0], s->mag[1], s->mag[2] };
-	vec3f_from_rift_vec(mag32, &priv->raw_mag);
+	vec3f_from_rift_vec(mag32, &raw_mag);
 
-	// TODO: handle overflows in a nicer way
-	float dt = TICK_LEN; // TODO: query the Rift for the sample rate
-	if (s->timestamp > priv->last_imu_timestamp)
-	{
-		dt = (s->timestamp - priv->last_imu_timestamp) / 1000000.0f;
+	uint32_t dt = TICK_LEN; // TODO: query the Rift for the sample rate
+
+	/* If we have a gap since the last sample handled, treat the
+	 * first sample here as having the full dt */
+	if (priv->have_imu_timestamp) {
+		dt = (s->timestamp - priv->last_imu_timestamp);
 		dt -= (s->num_samples - 1) * TICK_LEN; // TODO: query the Rift for the sample rate
 	}
 
-	for(int i = 0; i < s->num_samples; i++){
-		vec3f_from_rift_vec(s->samples[i].accel, &priv->raw_accel);
-		vec3f_from_rift_vec(s->samples[i].gyro, &priv->raw_gyro);
+	/* Compute the starting timestamps, in local system time and device time */
+	uint32_t total_dt = (s->num_samples-1)*TICK_LEN + dt;
+	uint32_t device_ts = s->timestamp - total_dt;
+	bool sent_exposure_update = false;
 
-		ofusion_update(&priv->sensor_fusion, dt, &priv->raw_gyro, &priv->raw_accel, &priv->raw_mag);
+	local_ts -= TICK_US_TO_NS(total_dt);
+
+	for(int i = 0; i < s->num_samples; i++){
+		vec3f raw_gyro, gyro;
+		vec3f raw_accel, accel;
+
+		/* if the exposure timestamp is earlier than this sample, report it now */
+		if (!sent_exposure_update && TICK_DIFF(device_ts, s->exposure_timestamp) >= 0) { 
+			rift_tracker_on_new_exposure (priv->tracker_ctx, device_ts, s->exposure_count,
+					s->exposure_timestamp, s->led_pattern_phase);
+			sent_exposure_update = true;
+		}
+
+		vec3f_from_rift_vec(s->samples[i].accel, &raw_accel);
+		vec3f_from_rift_vec(s->samples[i].gyro, &raw_gyro);
+
+		/* If the rift isn't applying calibration, we should */
+		if (!(priv->sensor_config.flags & RIFT_SCF_USE_CALIBRATION)) {
+				/* Apply the rotation matrix first, and then add the provided factory offsets */
+				ovec3f_multiply_mat3x3(&raw_gyro, priv->imu_calibration.gyro_matrix, &gyro);
+				ovec3f_add(&gyro, &priv->imu_calibration.gyro_offset, &gyro);
+
+				ovec3f_multiply_mat3x3(&raw_accel, priv->imu_calibration.accel_matrix, &accel);
+				ovec3f_add(&accel, &priv->imu_calibration.accel_offset, &accel);
+		}
+		else {
+				gyro = raw_gyro;
+				accel = raw_accel;
+		}
+
+		rift_tracked_device_imu_update(priv->tracked_dev, local_ts, device_ts, TICK_US_TO_SEC(dt), &gyro, &accel, &raw_mag);
+
+		device_ts += dt;
+		local_ts += TICK_US_TO_NS(dt);
 		dt = TICK_LEN; // TODO: query the Rift for the sample rate
 	}
-
 	priv->last_imu_timestamp = s->timestamp;
+	priv->have_imu_timestamp = true;
+
+	if (!sent_exposure_update) {
+		rift_tracker_on_new_exposure (priv->tracker_ctx, s->timestamp, s->exposure_count,
+				s->exposure_timestamp, s->led_pattern_phase);
+	}
 }
 
-static void handle_touch_controller_message(rift_hmd_t *hmd,
+static void dump_controller_calibration(rift_touch_controller_t *touch)
+{
+	rift_touch_calibration *c = &touch->calibration;
+	int i;
+
+	LOGI ("%s Controller IMU calibration  gyro_offset [ %f, %f, %f ]  accel_offset [ %f, %f, %f ]",
+		touch->base.id == 1 ? "Right" : "Left",
+		c->gyro_offset.x, c->gyro_offset.y, c->gyro_offset.z,
+		c->accel_offset.x, c->accel_offset.y, c->accel_offset.z);
+
+	LOGI("  gyro_calib = ");
+	for (i = 0; i < 3; i++) {
+		LOGI("  [ %8.3f, %8.3f, %8.3f ]", c->gyro_matrix[i][0],
+			c->gyro_matrix[i][1], c->gyro_matrix[i][2]);
+	}
+
+	LOGI("  accel_calib = ");
+	for (i = 0; i < 3; i++) {
+		LOGI("  [ %8.3f, %8.3f, %8.3f ]", c->accel_matrix[i][0],
+			c->accel_matrix[i][1], c->accel_matrix[i][2]);
+	}
+}
+
+static void handle_touch_controller_message(rift_hmd_t *hmd, uint64_t local_ts,
 		rift_touch_controller_t *touch, pkt_rift_radio_message *msg)
 {
 	// The top bits are carrying something unknown. Ignore them
@@ -254,11 +329,34 @@ static void handle_touch_controller_message(rift_hmd_t *hmd,
 		return;
 
 	if (!touch->have_calibration) {
+		rift_tracked_device_imu_calibration imu_calibration;
+		int i;
+
 		/* We need calibration data to do any more */
-		if (rift_touch_get_calibration (hmd->radio_handle, touch->device_num,
+		if (rift_touch_get_calibration (hmd->ctx, &hmd->radio, touch->device_num,
 				&touch->calibration) < 0)
 			return;
+
+		quatf imu_orient = {{ 0.0, 0.0, 0.0, 1.0 }};
+		posef imu_pose;
+		oposef_init(&imu_pose, &touch->calibration.imu_position, &imu_orient);
+
+		quatf model_orient = {{ 0.0, 0.0, 0.0, 1.0 }};
+		vec3f model_pos = {{ 0.0, 0.0, 0.0 }};
+		posef model_pose;
+		oposef_init(&model_pose, &model_pos, &model_orient);
+
+		/* Copy into imu_calibration array */
+		imu_calibration.accel_offset = touch->calibration.accel_offset;
+		imu_calibration.gyro_offset = touch->calibration.gyro_offset;
+		for (i = 0; i < 9; i++) {
+			imu_calibration.accel_matrix[i] = touch->calibration.accel_matrix[i/3][i%3];
+			imu_calibration.gyro_matrix[i] = touch->calibration.gyro_matrix[i/3][i%3];
+		}
+
+		touch->tracked_dev = rift_tracker_add_device (hmd->tracker_ctx, touch->base.id, &imu_pose, &model_pose, &touch->calibration.leds, &imu_calibration);
 		touch->have_calibration = true;
+		dump_controller_calibration(touch);
 	}
 
 	// time in microseconds
@@ -266,51 +364,41 @@ static void handle_touch_controller_message(rift_hmd_t *hmd,
 	if (touch->time_valid)
 		dt = msg->touch.timestamp - touch->last_timestamp;
 	else
-		dt = 0;
+		dt = 2000; /* 500Hz updates = 2000µS spacing */
+
+	uint32_t device_ts = msg->touch.timestamp - dt;
+	local_ts -= TICK_US_TO_NS(dt);
 
 	const double dt_s = 1e-6 * dt;
-	double a[3] = {
+	vec3f raw_accel = {{
 		OHMD_GRAVITY_EARTH / 2048 * msg->touch.accel[0],
 		OHMD_GRAVITY_EARTH / 2048 * msg->touch.accel[1],
 		OHMD_GRAVITY_EARTH / 2048 * msg->touch.accel[2],
-	};
-	double g[3] = {
-		2.0 / 2048 * msg->touch.gyro[0],
-		2.0 / 2048 * msg->touch.gyro[1],
-		2.0 / 2048 * msg->touch.gyro[2],
-	};
+	}};
+
+	/* Gyro is MPU 6500, configured for 2000°/s,
+	 * The datasheet has 16.4 LSB/°/s, but I'm using
+	 * 32768 / 2000 = 16.384 here because that actually
+	 * yields a 2000°/s full range, then converting to
+	 * radians for the fusion. */
+	vec3f raw_gyro = {{
+		msg->touch.gyro[0] / (16.384 * 180.0) * M_PI,
+		msg->touch.gyro[1] / (16.384 * 180.0) * M_PI,
+		msg->touch.gyro[2] / (16.384 * 180.0) * M_PI,
+	}};
 	vec3f mag = {{0.0f, 0.0f, 0.0f}};
 	vec3f gyro;
 	vec3f accel;
 
-	/* Apply correction offsets first - bottom row of the
-	 * calibration 3x4 matrix */
-	int i;
-	for (i = 0; i < 3; i++) {
-		a[i] -= c->acc_calibration[9 + i];
-		g[i] -= c->gyro_calibration[9 + i];
-	}
-	/* Then the 3x3 rotation matrix in row-major order */
-	accel.x = c->acc_calibration[0] * a[0] +
-			  c->acc_calibration[1] * a[1] +
-			  c->acc_calibration[2] * a[2];
-	accel.y = c->acc_calibration[3] * a[0] +
-			  c->acc_calibration[4] * a[1] +
-			  c->acc_calibration[5] * a[2];
-	accel.z = c->acc_calibration[6] * a[0] +
-			  c->acc_calibration[7] * a[1] +
-			  c->acc_calibration[8] * a[2];
-	gyro.x = c->gyro_calibration[0] * g[0] +
-			  c->gyro_calibration[1] * g[1] +
-			  c->gyro_calibration[2] * g[2];
-	gyro.y = c->gyro_calibration[3] * g[0] +
-			  c->gyro_calibration[4] * g[1] +
-			  c->gyro_calibration[5] * g[2];
-	gyro.z = c->gyro_calibration[6] * g[0] +
-			  c->gyro_calibration[7] * g[1] +
-			  c->gyro_calibration[8] * g[2];
+	/* For controllers, we apply the rotation matrix first,
+	 * and then add the provided factory offsets */
+	ovec3f_multiply_mat3x3(&raw_gyro, c->gyro_matrix, &gyro);
+	ovec3f_add(&gyro, &c->gyro_offset, &gyro);
 
-	ofusion_update(&touch->imu_fusion, dt_s, &gyro, &accel, &mag);
+	ovec3f_multiply_mat3x3(&raw_accel, c->accel_matrix, &accel);
+	ovec3f_add(&accel, &c->accel_offset, &accel);
+
+	rift_tracked_device_imu_update(touch->tracked_dev, local_ts, device_ts, dt_s, &gyro, &accel, &mag);
 	touch->last_timestamp = msg->touch.timestamp;
 	touch->time_valid = true;
 
@@ -381,7 +469,7 @@ static void handle_touch_controller_message(rift_hmd_t *hmd,
 	}
 }
 
-static void handle_rift_radio_message(rift_hmd_t *hmd, pkt_rift_radio_message *msg)
+static void handle_rift_radio_message(rift_hmd_t *hmd, uint64_t ts, pkt_rift_radio_message *msg)
 {
 	switch (msg->device_type) {
 		case RIFT_REMOTE:
@@ -391,15 +479,31 @@ static void handle_rift_radio_message(rift_hmd_t *hmd, pkt_rift_radio_message *m
 			hmd->remote_buttons_state = msg->remote.buttons;
 			break;
 		case RIFT_TOUCH_CONTROLLER_RIGHT:
-			handle_touch_controller_message (hmd, &hmd->touch_dev[0], msg);
+			handle_touch_controller_message (hmd, ts, &hmd->touch_dev[0], msg);
 			break;
 		case RIFT_TOUCH_CONTROLLER_LEFT:
-			handle_touch_controller_message (hmd, &hmd->touch_dev[1], msg);
+			handle_touch_controller_message (hmd, ts, &hmd->touch_dev[1], msg);
 			break;
 	}
 }
 
-static void handle_rift_radio_report(rift_hmd_t* hmd, unsigned char* buffer, int size)
+static void rift_send_keepalive(rift_hmd_t *priv)
+{
+	unsigned char buffer[FEATURE_BUFFER_SIZE];
+
+	// send keep alive message
+	pkt_keep_alive keep_alive = { 0, priv->sensor_config.keep_alive_interval };
+	int ka_size;
+	if (priv->revision == REV_DK1)
+		ka_size = encode_dk1_keep_alive(buffer, &keep_alive);
+	else
+		ka_size = encode_dk2_keep_alive(buffer, &keep_alive);
+	if (send_feature_report(priv, buffer, ka_size) == -1)
+		LOGW("error sending keepalive");
+}
+
+
+static void handle_rift_radio_report(rift_hmd_t* hmd, uint64_t ts, unsigned char* buffer, int size)
 {
 	pkt_rift_radio_report r;
 
@@ -407,62 +511,117 @@ static void handle_rift_radio_report(rift_hmd_t* hmd, unsigned char* buffer, int
 		return;
 
 	if (r.message[0].valid)
-		handle_rift_radio_message(hmd, &r.message[0]);
+		handle_rift_radio_message(hmd, ts, &r.message[0]);
 	if (r.message[1].valid)
-		handle_rift_radio_message(hmd, &r.message[1]);
+		handle_rift_radio_message(hmd, ts, &r.message[1]);
+}
+
+static void check_haptics_state(rift_hmd_t *hmd, uint64_t ts, rift_touch_controller_t *touch)
+{
+		/* Check if we need to clear the active haptic event */
+		if (touch->haptic_state.haptics_on && touch->haptic_state.end_time < ts) {
+			touch->haptic_state.haptics_on = false;
+			touch->haptic_state.dirty = true;
+		}
+
+		/* Check if we're trying / need to send the haptic state to the controller */
+		if (touch->haptic_state.dirty || touch->haptic_state.in_progress) {
+			uint8_t amplitude = 0;
+			int ret;
+
+			if (touch->haptic_state.haptics_on)
+				amplitude = touch->haptic_state.amplitude;
+
+			if (touch->haptic_state.dirty && touch->haptic_state.in_progress)
+				rift_touch_cancel_in_progress(&hmd->radio, touch->device_num);
+			touch->haptic_state.dirty = false;
+
+			ret = rift_touch_send_haptics(&hmd->radio, touch->device_num, touch->haptic_state.low_freq, amplitude);
+			if (ret == 0) {
+				/* Radio message was successfully sent, calculate the end time */
+				LOGD("Haptics sent, dev %d %s freq amplitude %u\n", touch->device_num, touch->haptic_state.low_freq ? "low" : "high", amplitude);
+				touch->haptic_state.in_progress = false;
+				if (touch->haptic_state.haptics_on) {
+					float duration = touch->haptic_state.duration;
+					touch->haptic_state.end_time = ts + roundf(duration * ohmd_monotonic_per_sec(hmd->ctx));
+				}
+			}
+			else if (ret == -EINPROGRESS || ret == -EBUSY) {
+				touch->haptic_state.in_progress = true;
+			} else {
+				/* For any other errors, cancel any on-going transmission */
+				rift_touch_cancel_in_progress(&hmd->radio, touch->device_num);
+				touch->haptic_state.in_progress = false;
+			}
+		}
 }
 
 static void update_hmd(rift_hmd_t *priv)
 {
 	unsigned char buffer[FEATURE_BUFFER_SIZE];
+	bool got_a_msg = false;
+	uint64_t start = ohmd_monotonic_get(priv->ctx);
 
 	// Handle keep alive messages
 	double t = ohmd_get_tick();
 	if(t - priv->last_keep_alive >= (double)priv->sensor_config.keep_alive_interval / 1000.0 - .2){
 		// send keep alive message
-		pkt_keep_alive keep_alive = { 0, priv->sensor_config.keep_alive_interval };
-		int ka_size = encode_dk1_keep_alive(buffer, &keep_alive);
-		if (send_feature_report(priv, buffer, ka_size) == -1)
-			LOGE("error sending keepalive");
-
+		rift_send_keepalive(priv);
 		// Update the time of the last keep alive we have sent.
 		priv->last_keep_alive = t;
 	}
 
+	/* Update any haptics state first */
+	check_haptics_state(priv, start, &priv->touch_dev[0]);
+	check_haptics_state(priv, start, &priv->touch_dev[1]);
+
 	// Read all the messages from the device.
-	while(true){
-		int size = hid_read(priv->handle, buffer, FEATURE_BUFFER_SIZE);
+	do {
+		int size;
+		/* FIXME: Collect all HID messages that are pending, then work backward to calculate capture timestamps? */
+		uint64_t ts = ohmd_monotonic_get(priv->ctx);
+
+		got_a_msg = false;
+
+		size = hid_read(priv->handle, buffer, FEATURE_BUFFER_SIZE);
 		if(size < 0){
-			LOGE("error reading from device");
+			LOGE("error reading from HMD");
 			break;
-		} else if(size == 0) {
-			break; // No more messages, return.
+		} else if(size > 0) {
+			// currently the only message type the hardware supports (I think)
+			if(buffer[0] == RIFT_IRQ_SENSORS_DK1 || buffer[0] == RIFT_IRQ_SENSORS_DK2) {
+				handle_tracker_sensor_msg(priv, ts, buffer, size);
+				ts = ohmd_monotonic_get(priv->ctx);
+				got_a_msg = true;
+			}else{
+				LOGE("unknown HMD message type: %u", buffer[0]);
+			}
 		}
 
-		// currently the only message type the hardware supports (I think)
-		if(buffer[0] == RIFT_IRQ_SENSORS_DK1 || buffer[0] == RIFT_IRQ_SENSORS_DK2) {
-			handle_tracker_sensor_msg(priv, buffer, size);
-		}else{
-			LOGE("unknown message type: %u", buffer[0]);
-		}
-	}
+		if (priv->radio_handle == NULL)
+			continue;
 
-	if (priv->radio_handle == NULL)
-		return;
-
-	// Read all the controller messages from the radio device.
-	while(true){
-		int size = hid_read(priv->radio_handle, buffer, FEATURE_BUFFER_SIZE);
+		// Read all the controller messages from the radio device.
+		size = hid_read(priv->radio_handle, buffer, FEATURE_BUFFER_SIZE);
 		if(size < 0){
-			LOGE("error reading from device");
+			LOGE("error reading from controllers");
 			break;
-		} else if(size == 0) {
-			break; // No more messages, return.
+		} else if(size > 0) {
+			if (buffer[0] == RIFT_RADIO_REPORT_ID) {
+				handle_rift_radio_report (priv, ts, buffer, size);
+				got_a_msg = true;
+				ts = ohmd_monotonic_get(priv->ctx);
+			}
 		}
 
-		if (buffer[0] == RIFT_RADIO_REPORT_ID)
-			handle_rift_radio_report (priv, buffer, size);
-	}
+
+		/* Don't loop for more than 5ms, or the app doesn't get a chance to draw anything */
+		if (got_a_msg) {
+			uint64_t now = ohmd_monotonic_get(priv->ctx);
+			if (now - start > 5000000)
+				break;
+		}
+	} while(got_a_msg);
 }
 
 static void update_device(ohmd_device* device)
@@ -484,8 +643,53 @@ static void update_device(ohmd_device* device)
 	update_hmd (dev_priv->hmd);
 }
 
+#define HISTLENGTH 5
+
+vec3f vAverage(vec3f *hist, vec3f new, float distFactor, int tick)
+{
+	vec3f total = {0,0,0};
+	for(int i = 0; i < HISTLENGTH; i++)
+	{
+		total.x += hist[i].x;
+		total.y += hist[i].y;
+		total.z += hist[i].z;
+	}
+	vec3f avg;
+	avg.x = total.x / HISTLENGTH;
+	avg.y = total.y / HISTLENGTH;
+	avg.z = total.z / HISTLENGTH;
+
+	vec3f diff = (vec3f){.x=abs(avg.x - new.x), .y=abs(avg.y - new.y), .z=abs(avg.z - new.z)};
+	float distance = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
+	int distHist = distFactor / distance;
+
+	printf("distHist: %i   distance: %f\n", distHist, distance);
+	total = (vec3f){0,0,0};
+	for(int i = 0; i < distHist; i++)
+	{
+		total.x += hist[i].x;
+		total.y += hist[i].y;
+		total.z += hist[i].z;
+	}
+	total.x += new.x;
+	total.y += new.y;
+	total.z += new.z;
+
+	avg.x = total.x / (distHist +1);
+	avg.y = total.y / (distHist +1);
+	avg.z = total.z / (distHist +1);
+
+	hist[tick%HISTLENGTH] = new;
+	return avg;
+}
+
+vec3f hmdPos[HISTLENGTH];
+int tick = 0;
+
 static int getf_hmd(rift_hmd_t *hmd, ohmd_float_value type, float* out)
 {
+	posef pose = { 0, };
+	
 	switch(type){
 	case OHMD_DISTORTION_K: {
 			for (int i = 0; i < 6; i++) {
@@ -495,14 +699,48 @@ static int getf_hmd(rift_hmd_t *hmd, ohmd_float_value type, float* out)
 		}
 
 	case OHMD_ROTATION_QUAT: {
-			*(quatf*)out = hmd->sensor_fusion.orient;
+			if (hmd->tracked_dev) {
+				rift_tracked_device_get_view_pose(hmd->tracked_dev, &pose, NULL, NULL, NULL);
+			}
+			*(quatf*)out = pose.orient;
 			break;
 		}
 
 	case OHMD_POSITION_VECTOR:
-		out[0] = out[1] = out[2] = 0;
+		if (hmd->tracked_dev) {
+			rift_tracked_device_get_view_pose(hmd->tracked_dev, &pose, NULL, NULL, NULL);
+		}
+		*(vec3f*)out = vAverage(hmdPos, pose.pos, 0.2f, tick);
+		tick++;
 		break;
 
+	case OHMD_VELOCITY_VECTOR: {
+		vec3f vel = { 0, };
+
+		if (hmd->tracked_dev) {
+			rift_tracked_device_get_view_pose(hmd->tracked_dev, NULL, &vel, NULL, NULL);
+		}
+		*(vec3f*)out = vel;
+		break;
+	}
+	case OHMD_ACCELERATION_VECTOR: {
+		vec3f accel = { 0, };
+
+		if (hmd->tracked_dev) {
+			rift_tracked_device_get_view_pose(hmd->tracked_dev, NULL, NULL, &accel, NULL);
+		}
+		*(vec3f*)out = accel;
+		break;
+	}
+	case OHMD_ANGULAR_VELOCITY_VECTOR: {
+		vec3f ang_vel = { 0, };
+
+		if (hmd->tracked_dev) {
+			rift_tracked_device_get_view_pose(hmd->tracked_dev, NULL, NULL, NULL, &ang_vel);
+		}
+		*(vec3f*)out = ang_vel;
+		break;
+	}
 	case OHMD_CONTROLS_STATE:
 		out[0] = (hmd->remote_buttons_state & RIFT_REMOTE_BUTTON_UP) != 0;
 		out[1] = (hmd->remote_buttons_state & RIFT_REMOTE_BUTTON_DOWN) != 0;
@@ -524,18 +762,70 @@ static int getf_hmd(rift_hmd_t *hmd, ohmd_float_value type, float* out)
 	return 0;
 }
 
+vec3f controllerPos[2][HISTLENGTH];
+rift_touch_controller_t controllerDevs[2] = {0,0};
+
+
 static int getf_touch_controller(rift_device_priv* dev_priv, ohmd_float_value type, float* out)
 {
 	rift_touch_controller_t *touch = (rift_touch_controller_t *)(dev_priv);
 
+	//made and get index for controllers
+	if(controllerDevs[0].base.id == (rift_touch_controller_t){0}.base.id)
+	{
+		controllerDevs[0] = *touch;
+	}else if (controllerDevs[1].base.id == (rift_touch_controller_t){0}.base.id && controllerDevs[0].base.id != touch->base.id)
+		controllerDevs[1] = *touch;
+	
+	int controllerIndex = 0;
+	if (controllerDevs[1].base.id == touch->base.id)
+	{
+		controllerIndex = 1;
+	}
+
+	posef pose = { 0, };
+
 	switch(type){
 	case OHMD_ROTATION_QUAT: {
-			*(quatf*)out = touch->imu_fusion.orient;
+			if (touch->tracked_dev) {
+				rift_tracked_device_get_view_pose(touch->tracked_dev, &pose, NULL, NULL, NULL);
+			}
+			*(quatf*)out = pose.orient;
 			break;
 		}
 	case OHMD_POSITION_VECTOR:
-		out[0] = out[1] = out[2] = 0;
+		if (touch->tracked_dev) {
+			rift_tracked_device_get_view_pose(touch->tracked_dev, &pose, NULL, NULL, NULL);
+		}
+		*(vec3f*)out = vAverage(controllerPos[controllerIndex], pose.pos, 0.2f, tick);
 		break;
+	case OHMD_VELOCITY_VECTOR: {
+		vec3f vel = { 0, };
+
+		if (touch->tracked_dev) {
+			rift_tracked_device_get_view_pose(touch->tracked_dev, NULL, &vel, NULL, NULL);
+		}
+		*(vec3f*)out = vel;
+		break;
+	}
+	case OHMD_ACCELERATION_VECTOR: {
+		vec3f accel = { 0, };
+
+		if (touch->tracked_dev) {
+			rift_tracked_device_get_view_pose(touch->tracked_dev, NULL, NULL, &accel, NULL);
+		}
+		*(vec3f*)out = accel;
+		break;
+	}
+	case OHMD_ANGULAR_VELOCITY_VECTOR: {
+		vec3f ang_vel = { 0, };
+
+		if (touch->tracked_dev) {
+			rift_tracked_device_get_view_pose(touch->tracked_dev, NULL, NULL, NULL, &ang_vel);
+		}
+		*(vec3f*)out = ang_vel;
+		break;
+	}
 	case OHMD_DISTORTION_K:
 		return -1;
 	case OHMD_CONTROLS_STATE:
@@ -544,6 +834,7 @@ static int getf_touch_controller(rift_device_priv* dev_priv, ohmd_float_value ty
 			out[1] = (touch->buttons & RIFT_TOUCH_CONTROLLER_BUTTON_B) != 0;
 			out[2] = (touch->buttons & RIFT_TOUCH_CONTROLLER_BUTTON_OCULUS) != 0;
 			out[3] = (touch->buttons & RIFT_TOUCH_CONTROLLER_BUTTON_STICK) != 0;
+
 		}
 		else { // left control, id == 2
 			out[0] = (touch->buttons & RIFT_TOUCH_CONTROLLER_BUTTON_X) != 0;
@@ -575,12 +866,67 @@ static int getf(ohmd_device* device, ohmd_float_value type, float* out)
 	return -1;
 }
 
+static int set_touch_haptics(ohmd_device *device, bool enable, float duration, float frequency, float amplitude)
+{
+	const float MIN_HAPTIC_DURATION = 0.01;
+
+	rift_device_priv* dev_priv = rift_device_priv_get(device);
+	rift_touch_controller_t *touch = (rift_touch_controller_t *)(dev_priv);
+
+	/* Change the haptics state. It will actually be sent to the controllers
+	 * in the update loop */
+	LOGD("New Haptics event, dev %d duration %f freq %f amplitude %f\n", touch->device_num, duration, frequency, amplitude);
+	if (enable) {
+			touch->haptic_state.haptics_on = true;
+			touch->haptic_state.dirty = true;
+			touch->haptic_state.low_freq = (frequency <= 160.0);
+			touch->haptic_state.amplitude = roundf(0xff * amplitude);
+			touch->haptic_state.duration = OHMD_MAX(duration, MIN_HAPTIC_DURATION);
+
+			touch->haptic_state.end_time = (uint64_t)(-1);
+	}
+	else if (touch->haptic_state.haptics_on) {
+			touch->haptic_state.haptics_on = false;
+			touch->haptic_state.dirty = true;
+	}
+
+	return 0;
+}
+
 static void close_device(ohmd_device* device)
 {
 	LOGD("closing device");
 	rift_device_priv* dev_priv = rift_device_priv_get(device);
 	dev_priv->opened = false;
 	release_hmd (dev_priv->hmd);
+}
+
+void
+rift_leds_init (rift_leds *leds, uint8_t num_points)
+{
+	leds->points = calloc(num_points, sizeof(rift_led));
+	leds->num_points = num_points;
+}
+
+void
+rift_leds_dump (rift_leds *leds, const char *desc)
+{
+	int i;
+	printf ("LED model: %s\n", desc);
+	for (i = 0; i < leds->num_points; i++) {
+		rift_led *p = leds->points + i;
+		printf ("{ .pos = {%f,%f,%f}, .dir={%f,%f,%f}, .pattern=0x%x },\n",
+		    p->pos.x, p->pos.y, p->pos.z,
+		    p->dir.x, p->dir.y, p->dir.z,
+		    p->pattern);
+	}
+}
+
+void
+rift_leds_clear (rift_leds *leds)
+{
+	free (leds->points);
+	leds->points = NULL;
 }
 
 /*
@@ -605,7 +951,7 @@ static int rift_get_led_info(rift_hmd_t *priv)
 
 		if (first_index < 0) {
 			first_index = pos.index;
-			priv->leds = calloc(pos.num, sizeof(rift_led));
+			rift_leds_init (&priv->leds, pos.num);
 		}
 
 		if (pos.flags == 1) { //reports 0's
@@ -613,21 +959,24 @@ static int rift_get_led_info(rift_hmd_t *priv)
 			priv->imu.pos.y = (float)pos.pos_y;
 			priv->imu.pos.z = (float)pos.pos_z;
 			LOGV ("IMU index %d pos x/y/x %d/%d/%d\n", pos.index, pos.pos_x, pos.pos_y, pos.pos_z);
+			ovec3f_multiply_scalar(&priv->imu.pos, 1.0/1000000.0, &priv->imu.pos); /* convert to metres */
 		} else if (pos.flags == 2) {
-			rift_led *led = &priv->leds[pos.index];
+			rift_led *led = &priv->leds.points[pos.index];
 			led->pos.x = (float)pos.pos_x;
 			led->pos.y = (float)pos.pos_y;
 			led->pos.z = (float)pos.pos_z;
 			led->dir.x = (float)pos.dir_x;
 			led->dir.y = (float)pos.dir_y;
 			led->dir.z = (float)pos.dir_z;
+			led->pattern = 0xff;
+			ovec3f_multiply_scalar(&led->pos, 1.0/1000000.0, &led->pos); /* convert to metres */
 			ovec3f_normalize_me(&led->dir);
 			if (pos.index >= num_leds)
 				num_leds = pos.index + 1;
 			LOGV ("LED index %d pos x/y/x %d/%d/%d\n", pos.index, pos.pos_x, pos.pos_y, pos.pos_z);
 		}
 	}
-	priv->num_leds = num_leds;
+	priv->leds.num_points = num_leds;
 
 	// Get LED patterns
 	first_index = -1;
@@ -644,13 +993,13 @@ static int rift_get_led_info(rift_hmd_t *priv)
 
 		if (first_index < 0) {
 			first_index = pkt.index;
-			if (priv->num_leds != pkt.num) {
-				LOGE("LED positions count doesn't match pattern count - got %d patterns for %d LEDs", pkt.num, priv->num_leds);
+			if (priv->leds.num_points != pkt.num) {
+				LOGE("LED positions count doesn't match pattern count - got %d patterns for %d LEDs", pkt.num, priv->leds.num_points);
 				return -1;
 			}
 		}
-		if (pkt.index >= priv->num_leds) {
-			LOGE("Invalid LED pattern index %d (%d LEDs)", pkt.index, priv->num_leds);
+		if (pkt.index >= priv->leds.num_points) {
+			LOGE("Invalid LED pattern index %d (%d LEDs)", pkt.index, priv->leds.num_points);
 			return -1;
 		}
 
@@ -685,8 +1034,31 @@ static int rift_get_led_info(rift_hmd_t *priv)
 		pattern |= pattern >> 8;
 		pattern = (pattern >> 1) & 0x3ff;
 
-		priv->leds[pkt.index].pattern = pattern;
+		priv->leds.points[pkt.index].pattern = pattern;
 	}
+
+	/* FIXME: Filter out the LEDs on the back of the headset strap for now, until the positional tracking copes with the
+	 * device articulation. At the moment, a camera that sees the back LEDs will extract the wrong position.
+	 * Headset LEDs have a Z < -100mm */
+	{
+		int in_index, out_index = 0;
+		for (in_index = 0; in_index < priv->leds.num_points; in_index++) {
+			rift_led *led = &priv->leds.points[in_index];
+			if (led->pos.z < -0.1) {
+				printf ("Dropping headband LED { .pos = {%f,%f,%f}, .dir={%f,%f,%f}, .pattern=0x%x },\n",
+					led->pos.x, led->pos.y, led->pos.z,
+					led->dir.x, led->dir.y, led->dir.z,
+					led->pattern);
+				continue;
+			}
+			if (in_index != out_index)
+				priv->leds.points[out_index] = *led;
+			out_index++;
+		}
+		priv->leds.num_points = out_index;
+	}
+
+	rift_leds_dump (&priv->leds, "HMD LEDs");
 
 	return 0;
 }
@@ -730,15 +1102,15 @@ static void init_touch_device(rift_touch_controller_t *touch, int id, int device
 {
 	ohmd_device *ohmd_dev = &touch->base.base;
 
+	touch->base.id = id;
 	touch->device_num = device_num;
-	ofusion_init(&touch->imu_fusion);
 	touch->time_valid = false;
 
 	ohmd_set_default_device_properties(&ohmd_dev->properties);
 
 	ohmd_dev->properties.control_count = 8;
 
-	if (id == 0) {
+	if (id == 1) {
 		ohmd_dev->properties.controls_hints[0] = OHMD_BUTTON_A;
 		ohmd_dev->properties.controls_hints[1] = OHMD_BUTTON_B;
 		ohmd_dev->properties.controls_hints[2] = OHMD_HOME; // Oculus button
@@ -773,9 +1145,11 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 
 	hmd_dev = &priv->hmd_dev;
 
+	priv->revision = desc->revision;
 	priv->use_count = 1;
 	priv->ctx = driver->ctx;
 
+	priv->have_imu_timestamp = false;
 	priv->last_imu_timestamp = -1;
 
 	// Open the HID device
@@ -795,6 +1169,11 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 		goto cleanup;
 	}
 
+	/* Send a keepalive msg first, to wake up the headset */
+	rift_send_keepalive(priv);
+	// Update the time of the last keep alive we have sent.
+	priv->last_keep_alive = ohmd_get_tick();
+
 	/* For the CV1, try and open the radio HID device */
 	if (desc->revision == REV_CV1) {
 		priv->radio_handle = open_hid_dev (driver->ctx, OCULUS_VR_INC_ID, RIFT_CV1_PID, 1);
@@ -804,6 +1183,7 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 			ohmd_set_error(driver->ctx, "Failed to set non-blocking on radio device");
 			goto cleanup;
 		}
+		rift_hmd_radio_init(&priv->radio, priv->radio_handle);
 	}
 
 	unsigned char buf[FEATURE_BUFFER_SIZE];
@@ -814,6 +1194,10 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 	size = get_feature_report(priv, RIFT_CMD_RANGE, buf);
 	decode_sensor_range(&priv->sensor_range, buf, size);
 	dump_packet_sensor_range(&priv->sensor_range);
+
+	size = get_feature_report(priv, RIFT_CMD_IMU_CALIBRATION, buf);
+	decode_imu_calibration(&priv->imu_calibration, buf, size);
+	dump_packet_imu_calibration(&priv->imu_calibration);
 
 	// Read and decode display information
 	size = get_feature_report(priv, RIFT_CMD_DISPLAY_INFO, buf);
@@ -828,7 +1212,8 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 	// if the sensor has display info data, use HMD coordinate frame
 	priv->coordinate_frame = priv->display_info.distortion_type != RIFT_DT_NONE ? RIFT_CF_HMD : RIFT_CF_SENSOR;
 
-	// enable calibration
+	// enable calibration, but these don't seem to stick. We check later if
+	// we need to do it manually
 	SETFLAG(priv->sensor_config.flags, RIFT_SCF_USE_CALIBRATION, 1);
 	SETFLAG(priv->sensor_config.flags, RIFT_SCF_AUTO_CALIBRATION, 1);
 
@@ -860,15 +1245,6 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 		ohmd_set_error(driver->ctx, "failed to read LED info from device");
 		goto cleanup;
 	}
-
-	// set keep alive interval to n seconds
-	pkt_keep_alive keep_alive = { 0, KEEP_ALIVE_VALUE };
-	size = encode_dk1_keep_alive(buf, &keep_alive);
-	if (send_feature_report(priv, buf, size) == -1)
-		LOGE("error setting up keepalive");
-
-	// Update the time of the last keep alive we have sent.
-	priv->last_keep_alive = ohmd_get_tick();
 
 	// update sensor settings with new keep alive value
 	// (which will have been ignored in favor of the default 1000 ms one)
@@ -912,8 +1288,8 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 		hmd_dev->base.properties.controls_types[8] = OHMD_DIGITAL;
 
 		/* And initialise state trackers for the 2 touch controllers */
-		init_touch_device (&priv->touch_dev[0], 0, RIFT_TOUCH_CONTROLLER_RIGHT);
-		init_touch_device (&priv->touch_dev[1], 1, RIFT_TOUCH_CONTROLLER_LEFT);
+		init_touch_device (&priv->touch_dev[0], 1, RIFT_TOUCH_CONTROLLER_RIGHT);
+		init_touch_device (&priv->touch_dev[1], 2, RIFT_TOUCH_CONTROLLER_LEFT);
 	}
 
 	//setup generic distortion coeffs, from hand-calibration
@@ -927,8 +1303,8 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 			ohmd_set_universal_aberration_k(&(hmd_dev->base.properties), 0.985, 1.000, 1.015);
 			break;
 		case REV_CV1:
-			ohmd_set_universal_distortion_k(&(hmd_dev->base.properties), 0.098, .324, -0.241, 0.819);
-			ohmd_set_universal_aberration_k(&(hmd_dev->base.properties), 0.9952420, 1.0, 1.0008074);
+			ohmd_set_universal_distortion_k(&(hmd_dev->base.properties), 0.269, -0.25, 0.178, 0.803);
+			ohmd_set_universal_aberration_k(&(hmd_dev->base.properties), 0.9992107, 1.0, 1.0120361);
 			/* CV1 reports IPD, but not lens center, at least not anywhere I could find, so use the manually measured value of 0.054 */
 			priv->display_info.lens_separation = 0.054;
 			hmd_dev->base.properties.lens_sep = priv->display_info.lens_separation;
@@ -964,8 +1340,30 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 	hmd_dev->id = 0;
 	hmd_dev->hmd = priv;
 
-	// initialize sensor fusion
-	ofusion_init(&priv->sensor_fusion);
+	// Find and attach Rift sensors if available
+	priv->tracker_ctx = rift_tracker_new (driver->ctx, priv->radio_address);
+
+	/* Configure the rift device in the tracker */
+	quatf imu_orient = {{ 0.0, 0.0, 0.0, 1.0 }};
+	posef imu_pose;
+	oposef_init(&imu_pose, &priv->imu.pos, &imu_orient);
+
+	/* The HMD LED model is rotated 180 deg around Y */
+	quatf model_orient = {{ 0.0, 1.0, 0.0, 0.0 }};
+	vec3f model_pos = {{ 0.0, 0.0, 0.0 }};
+	posef model_pose;
+	oposef_init(&model_pose, &model_pos, &model_orient);
+
+	rift_tracked_device_imu_calibration imu_calibration;
+	int i;
+
+	imu_calibration.accel_offset = priv->imu_calibration.accel_offset;
+	imu_calibration.gyro_offset = priv->imu_calibration.gyro_offset;
+	for (i = 0; i < 9; i++) {
+		imu_calibration.accel_matrix[i] = priv->imu_calibration.accel_matrix[i/3][i%3];
+		imu_calibration.gyro_matrix[i] = priv->imu_calibration.gyro_matrix[i/3][i%3];
+	}
+	priv->tracked_dev = rift_tracker_add_device (priv->tracker_ctx, 0, &imu_pose, &model_pose, &priv->leds, &imu_calibration);
 
 	return priv;
 
@@ -977,12 +1375,17 @@ cleanup:
 
 static void close_hmd(rift_hmd_t *hmd)
 {
-	if (hmd->leds)
-		free (hmd->leds);
-
-	if (hmd->radio_handle)
+	if (hmd->tracker_ctx)
+		rift_tracker_free(hmd->tracker_ctx);
+	if (hmd->radio_handle) {
+		rift_hmd_radio_clear(&hmd->radio);
 		hid_close(hmd->radio_handle);
+	}
 	hid_close(hmd->handle);
+
+	rift_touch_clear_calibration (&hmd->touch_dev[0].calibration);
+	rift_touch_clear_calibration (&hmd->touch_dev[1].calibration);
+	rift_leds_clear (&hmd->leds);
 	free(hmd);
 }
 
@@ -1024,6 +1427,7 @@ static ohmd_device* open_device(ohmd_driver* driver, ohmd_device_desc* desc)
 {
 	rift_device_priv *dev = NULL;
 	rift_hmd_t *hmd = find_hmd(desc->path);
+	bool is_controller = false;
 
 	if (hmd == NULL) {
 		hmd = open_hmd (driver, desc);
@@ -1034,10 +1438,13 @@ static ohmd_device* open_device(ohmd_driver* driver, ohmd_device_desc* desc)
 
 	if (desc->id == 0)
 		dev = &hmd->hmd_dev;
-	else if (desc->id == 1)
+	else if (desc->id == 1) {
 		dev = &hmd->touch_dev[0].base;
-	else if (desc->id == 2)
+		is_controller = true;
+	} else if (desc->id == 2) {
 		dev = &hmd->touch_dev[1].base;
+		is_controller = true;
+	}
 	else {
 		LOGE ("Invalid device description passed to open_device()");
 		release_hmd(hmd);
@@ -1052,6 +1459,9 @@ static ohmd_device* open_device(ohmd_driver* driver, ohmd_device_desc* desc)
 	dev->base.update = update_device;
 	dev->base.close = close_device;
 	dev->base.getf = getf;
+
+	if (is_controller)
+		dev->base.set_haptics = set_touch_haptics;
 
 	return &dev->base;
 }
@@ -1100,8 +1510,22 @@ static void get_device_list(ohmd_driver* driver, ohmd_device_list* list)
 				desc->driver_ptr = driver;
 				desc->id = id++;
 
-				/* For CV1, publish touch controllers */
+				/* For CV1, publish devices for the remote and touch controllers */
 				if (desc->revision == REV_CV1) {
+					// Remote Control
+					desc = &list->devices[list->num_devices++];
+					desc->revision = rd[i].rev;
+					desc->driver_ptr = driver;
+					desc->device_class = OHMD_DEVICE_CLASS_CONTROLLER;
+					desc->device_flags = 0;
+					desc->id = 0;
+
+					strcpy(desc->driver, "OpenHMD Rift Driver");
+					strcpy(desc->vendor, "Oculus VR, Inc.");
+					sprintf(desc->product, "%s: Remote Control", rd[i].name);
+
+					strcpy(desc->path, cur_dev->path);
+
 					//Controller 0 (right)
 					desc = &list->devices[list->num_devices++];
 					desc->revision = rd[i].rev;
@@ -1113,9 +1537,10 @@ static void get_device_list(ohmd_driver* driver, ohmd_device_list* list)
 					strcpy(desc->path, cur_dev->path);
 
 					desc->device_flags =
-						//OHMD_DEVICE_FLAGS_POSITIONAL_TRACKING |
+						OHMD_DEVICE_FLAGS_POSITIONAL_TRACKING |
 						OHMD_DEVICE_FLAGS_ROTATIONAL_TRACKING |
-						OHMD_DEVICE_FLAGS_RIGHT_CONTROLLER;
+						OHMD_DEVICE_FLAGS_RIGHT_CONTROLLER |
+						OHMD_DEVICE_FLAGS_HAPTIC_FEEDBACK;
 
 					desc->device_class = OHMD_DEVICE_CLASS_CONTROLLER;
 					desc->driver_ptr = driver;
@@ -1132,9 +1557,10 @@ static void get_device_list(ohmd_driver* driver, ohmd_device_list* list)
 					strcpy(desc->path, cur_dev->path);
 
 					desc->device_flags =
-						//OHMD_DEVICE_FLAGS_POSITIONAL_TRACKING |
+						OHMD_DEVICE_FLAGS_POSITIONAL_TRACKING |
 						OHMD_DEVICE_FLAGS_ROTATIONAL_TRACKING |
-						OHMD_DEVICE_FLAGS_LEFT_CONTROLLER;
+						OHMD_DEVICE_FLAGS_LEFT_CONTROLLER |
+						OHMD_DEVICE_FLAGS_HAPTIC_FEEDBACK;
 
 					desc->device_class = OHMD_DEVICE_CLASS_CONTROLLER;
 					desc->driver_ptr = driver;
@@ -1151,6 +1577,7 @@ static void get_device_list(ohmd_driver* driver, ohmd_device_list* list)
 static void destroy_driver(ohmd_driver* drv)
 {
 	LOGD("shutting down driver");
+
 	hid_exit();
 	free(drv);
 
