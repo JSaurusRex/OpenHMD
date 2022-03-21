@@ -618,9 +618,10 @@ void rift_tracked_device_get_view_pose(rift_tracked_device *dev_base, posef *pos
 		 * computing the IMU->device pose and applying the
 		 * IMU->world pose to get device->world pose */
 		oposef_apply(&dev->device_from_fusion, &imu_global_pose, &device_pose);
-
+		printf("new pose!\n");
 		dev->reported_pose.orient = device_pose.orient;
 		if (dev->device_time_ns - dev->last_observed_pose_ts >= (POSE_LOST_THRESHOLD * 1000000UL)) {
+				printf("uhhh. nothing found sir\n");
 		        /* Don't let the device move unless there's a recent observation of actual position */
 		        device_pose.pos = dev->reported_pose.pos;
 		        imu_vel.x = imu_vel.y = imu_vel.z = 0.0;
