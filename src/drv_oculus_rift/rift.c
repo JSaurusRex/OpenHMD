@@ -732,7 +732,7 @@ static int getf_hmd(rift_hmd_t *hmd, ohmd_float_value type, float* out)
 		if (hmd->tracked_dev) {
 			rift_tracked_device_get_view_pose(hmd->tracked_dev, &pose, NULL, NULL, NULL);
 		}
-		*(vec3f*)out = vAverage(hmdPos, pose.pos, 0.2f, tick);
+		*(vec3f*)out = vAverage(hmdPos, pose.pos, 0.005f, tick);
 		tick++;
 		break;
 
@@ -819,7 +819,7 @@ static int getf_touch_controller(rift_device_priv* dev_priv, ohmd_float_value ty
 		if (touch->tracked_dev) {
 			rift_tracked_device_get_view_pose(touch->tracked_dev, &pose, NULL, NULL, NULL);
 		}
-		*(vec3f*)out = vAverage(controllerPos[controllerIndex], pose.pos, 0.2f, tick);
+		*(vec3f*)out = vAverage(controllerPos[controllerIndex], pose.pos, 0.005f, tick);
 		break;
 	case OHMD_VELOCITY_VECTOR: {
 		vec3f vel = { 0, };
