@@ -30,7 +30,7 @@
 #define OCULUS_VR_INC_ID 0x2833
 #define SAMSUNG_ELECTRONICS_CO_ID 0x04e8
 #define RIFT_CV1_PID 0x0031
-
+rift-kalman-filter
 #define TICK_LEN (1000000 / 1000) // 1000 Hz ticks, in uS
 #define TICK_US_TO_NS(t) ((t) * 1000)
 #define TICK_US_TO_SEC(t) ((float)(t) / 1000000.0)
@@ -643,9 +643,53 @@ static void update_device(ohmd_device* device)
 	update_hmd (dev_priv->hmd);
 }
 
+#define HISTLENGTH 5
+
+vec3f vAverage(vec3f &hist[HISTLENGTH], vec3f new, float distFactor, int tick)
+{
+	vec3f total = {0,0,0};
+	for(int i = 0; i < HISTLENGTH; i++)
+	{
+		total.x += hist[i].x;
+		total.y += hist[i].y;
+		total.z += hist[i].z;
+	}
+	vec3f avg;
+	avg.x = total.x / HISTLENGTH;
+	avg.y = total.y / HISTLENGTH;
+	avg.z = total.z / HISTLENGTH;
+
+	vec3f diff = (vec3f){.x=abs(avg.x - new.x), .y=abs(avg.y - new.y), .z=abs(avg.z - new.z)};
+	float distance = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
+	int distHist = distFactor / distance;
+
+	printf("distHist: %i\n", distHist);
+	total = {0,0,0};
+	for(int i = 0; i < distHist; i++)
+	{
+		total.x += hist[i].x;
+		total.y += hist[i].y;
+		total.z += hist[i].z;
+	}
+	total.x += new.x;
+	total.y += new.y;
+	total.z += new.z;
+
+	avg.x = total.x / (distHist +1);
+	avg.y = total.y / (distHist +1);
+	avg.z = total.z / (distHist +1);
+
+	hist[tick%HISTLENGTH] = new;
+	return avg;
+}
+
+vec3f hmdPos[HISTLENGTH];
+int tick = 0;
+
 static int getf_hmd(rift_hmd_t *hmd, ohmd_float_value type, float* out)
 {
 	posef pose = { 0, };
+	tick++;
 
 	switch(type){
 	case OHMD_DISTORTION_K: {
@@ -667,7 +711,7 @@ static int getf_hmd(rift_hmd_t *hmd, ohmd_float_value type, float* out)
 		if (hmd->tracked_dev) {
 			rift_tracked_device_get_view_pose(hmd->tracked_dev, &pose, NULL, NULL, NULL);
 		}
-		*(vec3f*)out = pose.pos;
+		*(vec3f*)out = vAverage(hmdPos, pose.pos, 0.1, tick);
 		break;
 
 	case OHMD_VELOCITY_VECTOR: {
