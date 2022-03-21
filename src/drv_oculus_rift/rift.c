@@ -643,7 +643,7 @@ static void update_device(ohmd_device* device)
 	update_hmd (dev_priv->hmd);
 }
 
-#define HISTLENGTH 50
+#define HISTLENGTH 5
 
 void printVec3 (vec3f pp)
 {
