@@ -697,7 +697,7 @@ vec3f vAverage(vec3f *hist, vec3f new, float distFactor, int tick)
 	avg.y = total.y / (distHist +1);
 	avg.z = total.z / (distHist +1);
 
-	hist[1] = new;
+	hist[tick%HISTLENGTH] = new;
 	return avg;
 }
 
