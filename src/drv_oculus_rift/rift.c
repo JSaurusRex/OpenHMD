@@ -662,44 +662,18 @@ vec3f vAverage(vec3f *hist, vec3f new, float distFactor, int tick)
 		total.y += hist[i].y;
 		total.z += hist[i].z;
 	}
+	total.x += new.x;
+	total.y += new.y;
+	total.z += new.z;
 	vec3f avg;
 	avg.x = total.x / HISTLENGTH;
 	avg.y = total.y / HISTLENGTH;
 	avg.z = total.z / HISTLENGTH;
 
-
-	//printf("avg ");
-	//printVec3(total);
-	//printf("\n");
-
 	printf("avg ");
 	printVec3(avg);
 	printf("\n");
 
-	vec3f diff = (vec3f){.x=fabs(avg.x - new.x), .y=fabs(avg.y - new.y), .z=fabs(avg.z - new.z)};
-	float distance = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
-	int distHist = distFactor / distance;
-
-	//printf("distHist: %i   distance: %f\n", distHist, distance);
-	//printf("tick: %i   %i\n", tick, tick%HISTLENGTH);
-
-	if(distHist >= HISTLENGTH)
-		distHist = HISTLENGTH-1;
-	
-	total = (vec3f){0,0,0};
-	for(int i = 0; i < distHist; i++)
-	{
-		total.x += hist[i].x;
-		total.y += hist[i].y;
-		total.z += hist[i].z;
-	}
-	total.x += new.x;
-	total.y += new.y;
-	total.z += new.z;
-
-	avg.x = total.x / (distHist +1);
-	avg.y = total.y / (distHist +1);
-	avg.z = total.z / (distHist +1);
 
 	hist[tick%HISTLENGTH] = new;
 	return avg;
