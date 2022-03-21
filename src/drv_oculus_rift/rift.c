@@ -682,6 +682,9 @@ vec3f vAverage(vec3f *hist, vec3f new, float distFactor, int tick)
 
 	printf("distHist: %i   distance: %f\n", distHist, distance);
 	printf("tick: %i   %i\n", tick, tick%HISTLENGTH);
+
+	if(distHist >= HISTLENGTH)
+		distHist = HISTLENGTH-1;
 	
 	total = (vec3f){0,0,0};
 	for(int i = 0; i < distHist; i++)
