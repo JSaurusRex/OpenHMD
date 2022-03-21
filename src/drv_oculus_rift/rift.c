@@ -645,11 +645,19 @@ static void update_device(ohmd_device* device)
 
 #define HISTLENGTH 5
 
+void printVec3 (vec3f pp)
+{
+	printf("%f %f %f", pp.x, pp.y, pp.z);
+}
+
 vec3f vAverage(vec3f *hist, vec3f new, float distFactor, int tick)
 {
 	vec3f total = {0,0,0};
 	for(int i = 0; i < HISTLENGTH; i++)
 	{
+		printf("hist %i", i);
+		printVec3(hist[i]);
+		printf("\n");
 		total.x += hist[i].x;
 		total.y += hist[i].y;
 		total.z += hist[i].z;
@@ -659,11 +667,21 @@ vec3f vAverage(vec3f *hist, vec3f new, float distFactor, int tick)
 	avg.y = total.y / HISTLENGTH;
 	avg.z = total.z / HISTLENGTH;
 
+
+	printf("avg ");
+	printVec3(total);
+	printf("\n");
+
+	printf("avg ");
+	printVec3(avg);
+	printf("\n");
+
 	vec3f diff = (vec3f){.x=abs(avg.x - new.x), .y=abs(avg.y - new.y), .z=abs(avg.z - new.z)};
 	float distance = sqrtf(diff.x * diff.x + diff.y * diff.y + diff.z * diff.z);
 	int distHist = distFactor / distance;
 
 	printf("distHist: %i   distance: %f\n", distHist, distance);
+	
 	total = (vec3f){0,0,0};
 	for(int i = 0; i < distHist; i++)
 	{
